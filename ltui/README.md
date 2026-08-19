@@ -50,6 +50,8 @@ launch. ltui doesn't:
 | 🗂️  | **smart grouping** — `In Review` → `In Progress` → `Todo` → `Backlog` → `Done` — sorted by how close work is to shipping, freshest tickets first inside every group |
 | 👤  | **mine first** — your tickets float to the top of every group; press `m` to hide everyone else entirely |
 | 📁  | **project view** — `v` regroups the whole board by project (color-coded, status-ordered inside); the detail panel names each ticket's project |
+| 🎯  | **initiative view** — press `v` again to group by **initiative**, the level above projects: every project's tickets gathered under the goal they ladder up to, live initiatives first |
+| 🌐  | **every team at once** — the top row of the teams pane is **all teams**: one board spanning your whole workspace, with each team's `In Progress` merged into a single group instead of one per team |
 | 🌿  | **`y` yanks the git branch** — Linear's generated branch name straight to your clipboard (or the URL / identifier); ticket → `git checkout -b` in seconds |
 | 👥  | **assign without leaving** — `a` reassigns to anyone on the team, or you, or nobody |
 | 🌳  | **hierarchy aware** — the detail panel shows the parent ticket and all sub-issues with a done-count, next to blocked/blocking relations |
@@ -60,7 +62,7 @@ launch. ltui doesn't:
 | 🔍  | **instant filter** — `/` fuzzy-narrows by title, identifier, or assignee as you type |
 | 🌚  | **five themes** — `mocha`, pure-black `void`, monochrome `onyx`, `clear` (no background — your terminal's transparency/blur shows through), and `system` (drawn in your terminal's own ANSI palette: your kitty theme *is* the ltui theme) — cycle with `t` |
 | ⚙️  | **profile & settings** — who you are bottom-left, `,` opens a settings panel with live theme preview, preferences, and cache controls |
-| 🧠  | **remembers everything** — last team, theme, filters persist across sessions |
+| 🧠  | **remembers everything** — last team (or the all-teams board), grouping, theme, filters persist across sessions |
 | 🎛️  | **fully remappable** — every key rebindable via `~/.config/ltui/config.json` (`ltui --init-config`), with a vim motion layer (`ctrl+d/u`, `[`/`]` group jumps, `:` palette) out of the box |
 | 🔌  | **zero config** — reuses your [linear-cli](https://github.com/Finesssee/linear-cli) API key, or set `LINEAR_API_KEY` |
 
@@ -144,7 +146,7 @@ and `?` opens the full keybinding cheatsheet whenever you need it.
 | `←` `→`  | walk the panes: teams ◂ issues ▸ detail — `→` on a ticket opens it |
 | `enter` / click | open ticket detail panel                |
 | `esc`    | close panel / dismiss modal / clear filter    |
-| `n`      | **new ticket** in the current team            |
+| `n`      | **new ticket** in the current team (pick a team first on the all-teams board) |
 | `s`      | change **status**                             |
 | `p`      | change **priority**                           |
 | `a`      | change **assignee** (or unassign)             |
@@ -155,7 +157,7 @@ and `?` opens the full keybinding cheatsheet whenever you need it.
 | `y`      | **yank** — copy branch name / url / id        |
 | `/`      | filter issues                                 |
 | `m`      | toggle **mine only**                          |
-| `v`      | group by **status / project**                 |
+| `v`      | cycle grouping: **status → project → initiative** |
 | `V`      | filter to a **single project**                |
 | `t`      | cycle **theme**                               |
 | `,`      | open **settings**                             |
@@ -176,6 +178,42 @@ or `V` to zoom into a **single project** (works in either grouping).
 
 <div align="center">
 <img src="assets/projects.png" alt="group by project" width="80%">
+</div>
+
+## initiative view
+
+Most workspaces have structure *above* the team line: initiatives own projects,
+projects own tickets. Press `v` once more and the board regroups by
+**initiative** — every ticket gathered under the goal it ladders up to, no
+matter which project it came through. Active initiatives sort first, then
+planned, then finished; tickets whose project belongs to no initiative (and
+tickets with no project at all) collect in a `no initiative` bucket at the
+bottom.
+
+<div align="center">
+<img src="assets/initiatives.png" alt="group by initiative" width="80%">
+</div>
+
+## all teams
+
+The first row of the teams pane is **all teams** — one board over your entire
+workspace instead of a single team. It fetches every team in parallel, so it
+costs about the same wall-clock as one team and gives you 250 tickets *per
+team* rather than 250 across all of them.
+
+The catch it handles for you: Linear scopes workflow states to a team, so the
+`In Progress` on one team is a different state than the `In Progress` on
+another. The all-teams board merges status groups by **state type and name**,
+so you get one `In Progress` header, not one per team — while `s` still moves a
+ticket through its own team's real states. Ticket identifiers keep their team
+prefix (`CORE-128`, `INFRA-212`), so you always know where a row lives.
+
+Grouping works the same here: `v` regroups the whole workspace by project or
+initiative. `n` is the one thing that asks you to pick a real team first — a
+ticket has to be filed somewhere specific.
+
+<div align="center">
+<img src="assets/all-teams.png" alt="every team in one board" width="80%">
 </div>
 
 ## make it yours
@@ -273,7 +311,8 @@ launch ──▶ render cached issues (~50ms) ──▶ you're already working
                     └──▶ background refresh ──▶ rows swap in silently
 ```
 
-- issue lists cache to `~/.cache/ltui/` per team
+- issue lists cache to `~/.cache/ltui/` per team — the all-teams board is
+  assembled from those same per-team files, so it renders instantly too
 - mutations (status, priority, new tickets) update the cache immediately —
   what you see is always what you did
 - the `↻ refreshing` badge in the border tells you when fresh data is inbound
@@ -281,7 +320,7 @@ launch ──▶ render cached issues (~50ms) ──▶ you're already working
 
 ## data & privacy
 
-- **reads**: teams, issues, workflow states, comments — for the teams you view
+- **reads**: teams, issues, workflow states, initiatives, comments — for the teams you view
 - **writes**: only the mutations you explicitly trigger (create / status /
   priority / comment)
 - **talks to**: `api.linear.app` — nothing else, no telemetry, no analytics
@@ -295,7 +334,9 @@ launch ──▶ render cached issues (~50ms) ──▶ you're already working
 
 ltui fetches the 250 most-recently-updated issues per team. For triage that's
 effectively everything alive; ancient `Done` tickets fall off the bottom,
-which is where they belong.
+which is where they belong. The all-teams board keeps that budget per team
+rather than sharing one across the workspace, so five teams means up to 1250
+tickets in the list.
 
 </details>
 

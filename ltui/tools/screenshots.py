@@ -53,6 +53,21 @@ TEAMS = [
     {"id": "t-infra", "name": "Infra", "key": "INFRA", "color": "#a6e3a1"},
     {"id": "t-web", "name": "Website", "key": "WEB", "color": "#fab387"},
 ]
+T_CORE, T_INFRA, T_WEB = TEAMS
+BY_ID = {t["id"]: t for t in TEAMS}
+
+
+def states_for(team: dict) -> list[dict]:
+    """Linear scopes workflow states to a team, so the same "Todo" has a
+    different id on every one — which is what the all-teams board has to
+    merge back together."""
+    suf = "" if team["id"] == "t-core" else "-" + team["key"].lower()
+    return [{**s, "id": s["id"] + suf} for s in STATES]
+
+
+def state_of(team: dict, key: str) -> dict:
+    suf = "" if team["id"] == "t-core" else "-" + team["key"].lower()
+    return {**ST[key], "id": key + suf}
 
 DESC = """Split the monolithic sync engine into per-entity pipelines so a slow
 webhook can't stall the whole queue.
@@ -119,10 +134,11 @@ P_INFRA = {"id": "p-infra", "name": "Infra Hardening", "color": "#a6e3a1"}
 
 
 def issue(num, title, state, prio, assignee, labels, up_h, created_d=20, desc=None,
-          blocks=(), blocked_by=(), parent=None, project=None):
+          blocks=(), blocked_by=(), parent=None, project=None, team=None):
+    team = team or T_CORE
     return {
         "id": f"i-{num}",
-        "identifier": f"CORE-{num}",
+        "identifier": f"{team['key']}-{num}",
         "title": title,
         "description": desc,
         "url": "https://linear.app/demo/issue/CORE-1",
@@ -130,7 +146,7 @@ def issue(num, title, state, prio, assignee, labels, up_h, created_d=20, desc=No
         "branchName": f"nova/core-{num}-demo-branch",
         "updatedAt": ago(hours=up_h),
         "createdAt": ago(days=created_d),
-        "state": ST[state],
+        "state": state_of(team, state),
         "assignee": assignee,
         "labels": {"nodes": labels},
         "relations": {"nodes": [
@@ -141,6 +157,7 @@ def issue(num, title, state, prio, assignee, labels, up_h, created_d=20, desc=No
         ]},
         "parent": parent,
         "project": project,
+        "team": team,
     }
 
 
@@ -172,6 +189,46 @@ ISSUES = [
     issue(97, "Rewrite everything in a weekend", "st-cn", 0, None, [], 200),
 ]
 
+# the other two teams, so the all-teams board has something to span
+ISSUES_INFRA = [
+    issue(212, "Region failover drill for the EU cluster", "st-ir", 1, KAI, [L_INFRA], 2, project=P_INFRA, team=T_INFRA),
+    issue(209, "Terraform the staging VPC", "st-ip", 2, NOVA, [L_INFRA], 7, project=P_INFRA, team=T_INFRA),
+    issue(206, "Rotate the package signing keys", "st-ip", 1, KAI, [L_INFRA, L_BUG], 12, team=T_INFRA),
+    issue(203, "Drop the last bastion host", "st-td", 3, None, [L_INFRA], 33, project=P_INFRA, team=T_INFRA),
+    issue(201, "Nightly restore verification", "st-bl", 0, None, [L_INFRA], 96, team=T_INFRA),
+]
+
+ISSUES_WEB = [
+    issue(318, "Pricing page rewrite for the new tiers", "st-ip", 1, REI, [L_UX], 5, project=P_POLISH, team=T_WEB),
+    issue(314, "Docs search returns stale anchors", "st-td", 2, REI, [L_BUG], 18, team=T_WEB),
+    issue(311, "Dark mode for the marketing site", "st-td", 3, None, [L_UX], 44, project=P_POLISH, team=T_WEB),
+    issue(305, "Kill the jQuery bundle", "st-dn", 3, NOVA, [L_INFRA], 61, team=T_WEB),
+]
+
+TEAM_ISSUES = {
+    "t-core": ISSUES,
+    "t-infra": ISSUES_INFRA,
+    "t-web": ISSUES_WEB,
+}
+
+# initiatives sit above projects, which is how issues reach them
+IN_PLATFORM = {
+    "id": "in-platform", "name": "Platform 2026", "color": "#89b4fa",
+    "icon": None, "sortOrder": 1.0, "status": "Active",
+    "projects": {"nodes": [{"id": "p-sync"}, {"id": "p-infra"}]},
+}
+IN_GROWTH = {
+    "id": "in-growth", "name": "Self-serve Growth", "color": "#f9e2af",
+    "icon": None, "sortOrder": 2.0, "status": "Active",
+    "projects": {"nodes": [{"id": "p-polish"}]},
+}
+IN_LASTYEAR = {
+    "id": "in-lastyear", "name": "2025 Reliability Push", "color": "#6c7086",
+    "icon": None, "sortOrder": 0.5, "status": "Completed",
+    "projects": {"nodes": []},
+}
+INITIATIVES = [IN_PLATFORM, IN_GROWTH, IN_LASTYEAR]
+
 BOOT = {
     "viewer": {"id": "u-nova", "displayName": "nova"},
     "organization": {"name": "nebula labs"},
@@ -184,8 +241,12 @@ class DemoApp(LTUI):
         await asyncio.sleep(0.02)
         if "organization" in query:
             return BOOT
+        if "initiatives(first" in query:
+            return {"initiatives": {"nodes": INITIATIVES}}
         if "issues(first" in query:
-            return {"team": {"issues": {"nodes": ISSUES}, "states": {"nodes": STATES}}}
+            team = BY_ID.get((variables or {}).get("teamId"), T_CORE)
+            return {"team": {"issues": {"nodes": TEAM_ISSUES[team["id"]]},
+                             "states": {"nodes": states_for(team)}}}
         if "members(first" in query:
             return {"team": {"members": {"nodes": [NOVA, KAI, REI]}}}
         if "labels(first: 100" in query:
@@ -305,6 +366,28 @@ async def open_projects(app, pilot):
     await pilot.pause(0.3)
 
 
+async def open_initiatives(app, pilot):
+    while app._group_by != "initiative":
+        await pilot.press("v")
+        await pilot.pause(0.3)
+    await pilot.pause(0.4)
+
+
+async def open_all_teams(app, pilot):
+    teams = app.query_one("#teams")
+    teams.focus()
+    teams.highlighted = 0
+    await pilot.pause(0.1)
+    await pilot.press("enter")
+    for _ in range(60):
+        await pilot.pause(0.1)
+        seen = {(i.get("team") or {}).get("id") for i in app._issues}
+        if app._all_teams and len(seen) > 1:
+            break
+    app.query_one("#issues").focus()
+    await pilot.pause(0.4)
+
+
 async def open_themes(app, pilot):
     app.action_change_theme()
     await pilot.pause(0.3)
@@ -322,6 +405,8 @@ async def main():
     await shot("settings", size=(148, 41), drive=open_settings)
     await shot("themes", size=(148, 41), drive=open_themes)
     await shot("projects", size=(148, 41), drive=open_projects)
+    await shot("initiatives", size=(148, 41), drive=open_initiatives)
+    await shot("all-teams", size=(148, 41), drive=open_all_teams)
     await onboard_shot("onboard")
     await welcome_shot("welcome")
     await shot("theme-void", size=(148, 41), theme="void")
