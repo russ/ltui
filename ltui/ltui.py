@@ -12,6 +12,7 @@ from __future__ import annotations
 
 __version__ = "0.15.0"
 
+import asyncio
 import json
 import sys
 import tomllib
@@ -197,6 +198,22 @@ TYPE_RANK = {
 
 PRIORITIES = [(1, "Urgent"), (2, "High"), (3, "Medium"), (4, "Low"), (0, "No priority")]
 
+INITIATIVE_RANK = {
+    "Active": 0,
+    "Planned": 1,
+    "Proposed": 2,
+    "Completed": 3,
+    "Canceled": 4,
+}
+
+GROUP_MODES = ["status", "project", "initiative"]
+
+# the "every team at once" board. A pseudo-team so the sidebar, the state file
+# and the staleness guards can all keep treating the scope as one selectable
+# thing; ALL_TEAMS_ID is not a real Linear id and must never reach the API.
+ALL_TEAMS_ID = "*"
+ALL_TEAMS = {"id": ALL_TEAMS_ID, "key": "ALL", "name": "all teams", "color": None}
+
 # ── graphql ───────────────────────────────────────────────────────────────
 ISSUE_FIELDS = """
         id identifier title description url priority branchName
@@ -208,6 +225,7 @@ ISSUE_FIELDS = """
         inverseRelations(first: 6) { nodes { type issue { identifier } } }
         project { id name color }
         parent { identifier }
+        team { id name key color }
 """
 
 QL_BOOT = """
@@ -252,6 +270,20 @@ QL_MEMBERS = """
 query($teamId: String!) {
   team(id: $teamId) {
     members(first: 50) { nodes { id displayName } }
+  }
+}"""
+
+# initiatives sit above teams, so this one is workspace-wide rather than
+# team-scoped. Issues carry no initiative of their own — the path is
+# issue → project → initiative — so we fetch the projects of each
+# initiative once and invert that into a project id → initiative map.
+QL_INITIATIVES = """
+query {
+  initiatives(first: 100) {
+    nodes {
+      id name color icon sortOrder status
+      projects(first: 100) { nodes { id } }
+    }
   }
 }"""
 
@@ -541,6 +573,24 @@ def state_sort_key(s: dict):
 def issue_sort_key(i: dict):
     # most recently updated first within each status group
     return (-parse_dt(i["updatedAt"]).timestamp(),)
+
+
+def initiative_sort_key(init: dict):
+    # live work first, then the workspace's own manual ordering
+    rank = INITIATIVE_RANK.get(init.get("status") or "", 9)
+    return (rank, init.get("sortOrder") or 0.0, init.get("name") or "")
+
+
+def state_group_key(s: dict, merged: bool) -> str:
+    """What decides that two rows share a status header.
+
+    Workflow states are team-scoped, so the same "In Progress" is a different
+    state id on every team. A board spanning teams has to group on the pair
+    that is stable across them instead.
+    """
+    if merged:
+        return f"{s['type']}\x00{s['name']}"
+    return s["id"]
 
 
 def load_state() -> dict:
@@ -1173,7 +1223,7 @@ class HelpModal(ModalScreen):
         ("view", [
             ("/", "filter issues"),
             ("m", "toggle mine only"),
-            ("v", "group by status / project"),
+            ("v", "group by status / project / initiative"),
             ("V", "filter to a single project"),
             ("t", "cycle theme"),
             (",", "settings"),
@@ -1474,6 +1524,8 @@ class LTUI(App):
         self._org: str | None = None
         self._mine = load_state().get("mine", False)
         self._group_by = load_state().get("group_by", "status")
+        if self._group_by not in GROUP_MODES:
+            self._group_by = "status"
         self._filter = ""
         self._project_filter: str | None = None  # project id, "" = no-project
         self._detail_issue: dict | None = None
@@ -1483,6 +1535,12 @@ class LTUI(App):
         self._spin_frame = 0
         self._opt_index: dict[str, int] = {}
         self._issue_by_id: dict[str, dict] = {}
+        # workflow states keyed by team id. On a single-team board this is just
+        # that team; on the all-teams board it is how a mutation gets back from
+        # a merged status group to the real, team-scoped state id.
+        self._states_by_team: dict[str, list[dict]] = {}
+        self._initiatives: list[dict] | None = None  # None = never fetched
+        self._init_of_project: dict[str, dict] = {}
 
     def _on_theme_changed(self, _theme) -> None:
         # ansi-background themes (clear, ansi-dark, …) need ansi_color mode
@@ -1590,15 +1648,21 @@ class LTUI(App):
             timeout=20,
         )
         # render instantly from cache, then refresh live data concurrently
-        team = None
+        scope = None
         if boot_cache := read_cache("boot"):
             self._render_boot(boot_cache)
             last_id = load_state().get("team_id")
-            team = next((t for t in self._teams if t["id"] == last_id), None)
-        if team is not None:
-            self.query_one("#teams", NavList).highlighted = self._teams.index(team)
-            self.load_team(team)
-        self.boot(pick_team=team is None)
+            scope = next(
+                (t for t in self._sidebar_scopes() if t["id"] == last_id), None
+            )
+        if scope is not None:
+            idx = self._scope_index(scope["id"])
+            if idx is not None:
+                self.query_one("#teams", NavList).highlighted = idx
+            self._load_scope(scope)
+        if init_cache := read_cache("initiatives"):
+            self._set_initiatives(init_cache["initiatives"])
+        self.boot(pick_team=scope is None)
         refresh_s = CONFIG_OPTIONS.get("auto_refresh_seconds", AUTO_REFRESH_SECONDS)
         if isinstance(refresh_s, (int, float)) and refresh_s > 0:
             self.set_interval(refresh_s, self._auto_refresh_board)
@@ -1626,6 +1690,29 @@ class LTUI(App):
         return data["data"]
 
     # ── workers ───────────────────────────────────────────────────────
+    def _sidebar_scopes(self) -> list[dict]:
+        """Everything selectable in the teams pane, in display order.
+
+        The all-teams row leads the list, and only exists when there is more
+        than one team for it to span — otherwise it would just be a second name
+        for the same board.
+        """
+        if len(self._teams) > 1:
+            return [ALL_TEAMS, *self._teams]
+        return list(self._teams)
+
+    def _scope_index(self, scope_id: str) -> int | None:
+        return next(
+            (n for n, t in enumerate(self._sidebar_scopes()) if t["id"] == scope_id),
+            None,
+        )
+
+    def _load_scope(self, scope: dict) -> None:
+        if scope["id"] == ALL_TEAMS_ID:
+            self.load_all_teams()
+        else:
+            self.load_team(scope)
+
     def _render_boot(self, data: dict) -> None:
         self._boot_data = data
         self._teams = data["teams"]["nodes"]
@@ -1637,17 +1724,19 @@ class LTUI(App):
 
         teams_list = self.query_one("#teams", NavList)
         teams_list.clear_options()
-        for t in self._teams:
+        for t in self._sidebar_scopes():
             row = Text()
-            row.append("● ", style=t.get("color") or C_BLUE)
-            row.append(t["name"], style=C_TEXT)
-            row.append(f"  {t['key']}", style=C_DIM)
+            if t["id"] == ALL_TEAMS_ID:
+                row.append("\uf03a ", style=C_LAV)
+                row.append(t["name"], style=C_TEXT)
+                row.append(f"  {len(self._teams)}", style=C_DIM)
+            else:
+                row.append("● ", style=t.get("color") or C_BLUE)
+                row.append(t["name"], style=C_TEXT)
+                row.append(f"  {t['key']}", style=C_DIM)
             teams_list.add_option(Option(row, id=t["id"]))
         if self._team is not None:
-            idx = next(
-                (n for n, t in enumerate(self._teams) if t["id"] == self._team["id"]),
-                None,
-            )
+            idx = self._scope_index(self._team["id"])
             if idx is not None:
                 teams_list.highlighted = idx
 
@@ -1665,18 +1754,28 @@ class LTUI(App):
             return
         self._render_boot(data)
         write_cache("boot", data)
+        self.load_initiatives(rerender=True)
         if not pick_team:
             return
+        if self._team is not None:
+            # a cold boot has no cache to render from, so the board the user
+            # picks while this query is in flight arrives first — don't drag
+            # them back to the remembered one (both loaders share the exclusive
+            # "issues" worker group, so doing so would cancel theirs)
+            return
         last = load_state().get("team_id")
-        team = next((t for t in self._teams if t["id"] == last), None) or (
+        scopes = self._sidebar_scopes()
+        scope = next((t for t in scopes if t["id"] == last), None) or (
             self._teams[0] if self._teams else None
         )
-        if team is None:
+        if scope is None:
             issues_list.loading = False
             self.notify("no teams found", severity="warning")
             return
-        self.query_one("#teams", NavList).highlighted = self._teams.index(team)
-        self.load_team(team)
+        idx = self._scope_index(scope["id"])
+        if idx is not None:
+            self.query_one("#teams", NavList).highlighted = idx
+        self._load_scope(scope)
 
     def _save_layout(self, reset: str | None = None) -> None:
         data = load_state()
@@ -1700,17 +1799,96 @@ class LTUI(App):
         data["group_by"] = self._group_by
         save_state(data)
 
+    @property
+    def _all_teams(self) -> bool:
+        return self._team is not None and self._team["id"] == ALL_TEAMS_ID
+
+    def _scope_id(self) -> str | None:
+        """Which board is on screen — a team id, or ALL_TEAMS_ID.
+
+        Workers that await compare this before and after to notice the user
+        moving to another board mid-fetch.
+        """
+        return None if self._team is None else self._team["id"]
+
+    def _team_of(self, issue: dict | None) -> dict | None:
+        """The team an issue belongs to.
+
+        On a single-team board that is always the selected team; on the
+        all-teams board it has to come off the issue itself. Caches written
+        before issues carried a team fall back to the selected team, which is
+        correct everywhere except the all-teams board (where it returns None
+        rather than the ALL pseudo-team, so callers can refuse politely).
+        """
+        team = (issue or {}).get("team")
+        if team and team.get("id"):
+            return team
+        return None if self._all_teams else self._team
+
+    def _states_for(self, issue: dict | None) -> list[dict]:
+        """The workflow states of the issue's own team.
+
+        Linear scopes states to a team, so the merged list the all-teams board
+        renders from can never be handed to a mutation.
+        """
+        team = self._team_of(issue)
+        if team is None:
+            return []
+        return self._states_by_team.get(team["id"], self._states)
+
     def _write_team_cache(self) -> None:
-        if self._team is not None:
-            write_cache(
-                f"team-{self._team['id']}",
-                {"issues": self._issues, "states": self._states},
-            )
+        if self._team is None:
+            return
+        if self._all_teams:
+            # the all-teams board owns no cache file of its own; it is assembled
+            # from the per-team ones, so an optimistic edit is written back into
+            # whichever team's cache the issue actually came from
+            by_team: dict[str, list[dict]] = {}
+            for i in self._issues:
+                team = i.get("team") or {}
+                if team.get("id"):
+                    by_team.setdefault(team["id"], []).append(i)
+            for team_id, issues in by_team.items():
+                states = self._states_by_team.get(team_id)
+                if states:
+                    write_cache(f"team-{team_id}", {"issues": issues, "states": states})
+            return
+        write_cache(
+            f"team-{self._team['id']}",
+            {"issues": self._issues, "states": self._states},
+        )
 
     def _set_issues(self, issues: list[dict], states: list[dict]) -> None:
         self._issues = issues
         self._states = states
         self._issue_by_id = {i["id"]: i for i in issues}
+        if self._team is not None and not self._all_teams:
+            self._states_by_team[self._team["id"]] = states
+
+    def _set_initiatives(self, nodes: list[dict]) -> None:
+        self._initiatives = sorted(nodes, key=initiative_sort_key)
+        # a project can hang off more than one initiative; grouping needs one
+        # bucket per issue, so the initiative that sorts first wins and the
+        # choice stays stable between renders
+        self._init_of_project = {}
+        for init in self._initiatives:
+            for proj in (init.get("projects") or {}).get("nodes") or []:
+                self._init_of_project.setdefault(proj["id"], init)
+
+    @work(exclusive=True, group="initiatives")
+    async def load_initiatives(self, rerender: bool = False) -> None:
+        try:
+            data = await self.gql(QL_INITIATIVES)
+        except Exception as e:
+            if self._initiatives is None:
+                self._initiatives = []  # don't retry-storm a workspace without them
+            self.notify(f"initiatives: {e}", severity="warning", timeout=6)
+            return
+        nodes = data["initiatives"]["nodes"]
+        self._set_initiatives(nodes)
+        write_cache("initiatives", {"initiatives": nodes})
+        if rerender and self._group_by == "initiative":
+            self.render_issues()
 
     @work(exclusive=True, group="issues")
     async def load_team(self, team: dict) -> None:
@@ -1760,6 +1938,117 @@ class LTUI(App):
                 self._detail_issue = fresh
                 self._update_detail_meta(fresh)
 
+    @staticmethod
+    def _stamp_team(issues: list[dict], team: dict) -> list[dict]:
+        # caches written before issues carried a team still need one, and the
+        # all-teams board is the only place the answer isn't implicit
+        slim = {"id": team["id"], "name": team["name"], "key": team["key"],
+                "color": team.get("color")}
+        for i in issues:
+            if not (i.get("team") or {}).get("id"):
+                i["team"] = slim
+        return issues
+
+    @staticmethod
+    def _merge_states(per_team: dict[str, list[dict]]) -> list[dict]:
+        """One status row per (type, name) across every team.
+
+        Keeps the earliest position so the merged board orders its groups the
+        way the busiest team does. The returned dicts keep a real state id, but
+        only ever as a rendering detail — mutations go through _states_for.
+        """
+        merged: dict[str, dict] = {}
+        for states in per_team.values():
+            for s in states:
+                key = state_group_key(s, True)
+                prev = merged.get(key)
+                if prev is None or (s["position"] or 0) < (prev["position"] or 0):
+                    merged[key] = s
+        return sorted(merged.values(), key=state_sort_key)
+
+    @work(exclusive=True, group="issues")
+    async def load_all_teams(self) -> None:
+        """Every team's board in one list.
+
+        Fans the existing per-team query out concurrently rather than using
+        Linear's workspace-wide issues query: it costs the same wall-clock,
+        returns 250 issues *per team* instead of 250 in total, and keeps the
+        per-team disk caches — and the team-scoped workflow states that
+        mutations need — intact.
+        """
+        self._team = ALL_TEAMS
+        teams = list(self._teams)
+        centre = self.query_one("#centre")
+        centre.border_title = f" ALL · {len(teams)} teams "
+        centre.border_subtitle = ""
+        issues_list = self.query_one("#issues", NavList)
+
+        cached_states: dict[str, list[dict]] = {}
+        cached_issues: list[dict] = []
+        for t in teams:
+            cached = read_cache(f"team-{t['id']}")
+            if cached:
+                cached_issues += self._stamp_team(cached["issues"], t)
+                cached_states[t["id"]] = cached["states"]
+        if cached_issues:
+            self._states_by_team.update(cached_states)
+            self._set_issues(cached_issues, self._merge_states(cached_states))
+            self.render_issues()
+            centre.border_subtitle = f" {len(self._issues)} · ↻ refreshing "
+            self._refreshing = True
+        else:
+            issues_list.loading = True
+        self._save_state()
+
+        results = await asyncio.gather(
+            *(self.gql(QL_ISSUES, {"teamId": t["id"]}) for t in teams),
+            return_exceptions=True,
+        )
+        if not self._all_teams:
+            self._refreshing = False
+            return  # user left the all-teams board while it was refreshing
+
+        issues: list[dict] = []
+        per_team: dict[str, list[dict]] = {}
+        failed: list[str] = []
+        for t, data in zip(teams, results):
+            if isinstance(data, Exception) or not data.get("team"):
+                failed.append(t["key"])
+                # keep whatever that team last had rather than dropping it
+                if t["id"] in self._states_by_team:
+                    per_team[t["id"]] = self._states_by_team[t["id"]]
+                    issues += [i for i in cached_issues
+                               if (i.get("team") or {}).get("id") == t["id"]]
+                continue
+            issues += self._stamp_team(data["team"]["issues"]["nodes"], t)
+            per_team[t["id"]] = data["team"]["states"]["nodes"]
+            write_cache(
+                f"team-{t['id']}",
+                {"issues": data["team"]["issues"]["nodes"],
+                 "states": data["team"]["states"]["nodes"]},
+            )
+
+        issues_list.loading = False
+        self._refreshing = False
+        if failed and len(failed) == len(teams):
+            self.notify("linear: could not load any team", severity="error", timeout=10)
+            return
+        if failed:
+            self.notify(f"linear: {', '.join(failed)} failed to refresh",
+                        severity="warning", timeout=8)
+        self._states_by_team.update(per_team)
+        self._set_issues(issues, self._merge_states(per_team))
+        self.render_issues()
+        if not cached_issues and self._detail_issue is None:
+            focused = self.focused
+            if focused is None or focused.id == "teams":
+                issues_list.focus()
+        if self._detail_issue is not None:
+            fresh = self._issue_by_id.get(self._detail_issue["id"])
+            if fresh is not None:
+                self._detail_issue = fresh
+                self._update_detail_meta(fresh)
+
     # NOT named _auto_refresh: textual's DOMNode owns that instance attribute
     # (backing field of the auto_refresh property) and would shadow the method
     def _auto_refresh_board(self) -> None:
@@ -1776,7 +2065,10 @@ class LTUI(App):
             for w in self.workers
         ):
             return
-        self.load_team(self._team)
+        if self._all_teams:
+            self.load_all_teams()
+        else:
+            self.load_team(self._team)
 
     @work(exclusive=True, group="detail")
     async def load_comments(self, issue: dict) -> None:
@@ -1971,9 +2263,12 @@ class LTUI(App):
             is_mine = (i.get("assignee") or {}).get("id") == self._viewer_id
             return (0 if is_mine else 1, *issue_sort_key(i))
 
+        def in_group_key(i: dict):
+            # inside a project / initiative keep the status order, then
+            # mine-first + recency
+            return (state_sort_key(i["state"]), *mine_first(i))
+
         if self._group_by == "project":
-            # group by project; inside a project keep the status order,
-            # then mine-first + recency
             by_proj: dict[str, list[dict]] = {}
             proj_of: dict[str, dict] = {}
             for i in issues:
@@ -1985,24 +2280,49 @@ class LTUI(App):
                 proj_of.values(),
                 key=lambda p: (p["id"] == "", -len(by_proj[p["id"]])),
             )
-            def in_group_key(i: dict):
-                return (state_sort_key(i["state"]), *mine_first(i))
             groups = [
                 (self._project_header_row(p, len(by_proj[p["id"]]), width),
                  sorted(by_proj[p["id"]], key=in_group_key))
                 for p in ordered_groups
             ]
+        elif self._group_by == "initiative":
+            # issues reach an initiative through their project, so anything
+            # without a project — or in a project no initiative claims — lands
+            # in the same trailing bucket
+            by_init: dict[str, list[dict]] = {}
+            init_of: dict[str, dict] = {}
+            for i in issues:
+                pid = (i.get("project") or {}).get("id")
+                init = self._init_of_project.get(pid) if pid else None
+                init = init or {"id": "", "name": "no initiative", "color": None}
+                by_init.setdefault(init["id"], []).append(i)
+                init_of[init["id"]] = init
+            ordered_groups = sorted(
+                init_of.values(),
+                key=lambda x: (x["id"] == "", initiative_sort_key(x)),
+            )
+            groups = [
+                (self._initiative_header_row(x, len(by_init[x["id"]]), width),
+                 sorted(by_init[x["id"]], key=in_group_key))
+                for x in ordered_groups
+            ]
         else:
+            # a board spanning teams has to merge status groups on (type, name):
+            # Linear scopes workflow states to a team, so one "In Progress" per
+            # team would otherwise mean one header per team
+            merged = self._all_teams
             by_state: dict[str, list[dict]] = {}
             state_of: dict[str, dict] = {}
             for i in issues:
-                sid = i["state"]["id"]
-                by_state.setdefault(sid, []).append(i)
-                state_of[sid] = i["state"]
+                key = state_group_key(i["state"], merged)
+                by_state.setdefault(key, []).append(i)
+                prev = state_of.get(key)
+                if prev is None or (i["state"]["position"] or 0) < (prev["position"] or 0):
+                    state_of[key] = i["state"]
             ordered_states = sorted(state_of.values(), key=state_sort_key)
             groups = [
-                (self._header_row(st, len(by_state[st["id"]]), width),
-                 sorted(by_state[st["id"]], key=mine_first))
+                (self._header_row(st, len(by_state[state_group_key(st, merged)]), width),
+                 sorted(by_state[state_group_key(st, merged)], key=mine_first))
                 for st in ordered_states
             ]
 
@@ -2037,8 +2357,13 @@ class LTUI(App):
                 "no project",
             ) or "no project"
             proj_tag = f" \uf07b {pname} \u00b7"
+        # with three groupings the active one is worth stating; status is the
+        # default the headers already make obvious
+        group_tag = (
+            f" \uf0ca {self._group_by} \u00b7" if self._group_by != "status" else ""
+        )
         self.query_one("#centre").border_subtitle = (
-            f"{mine_tag}{proj_tag} {len(issues)} issues "
+            f"{mine_tag}{proj_tag}{group_tag} {len(issues)} issues "
         )
         if keep and keep in self._opt_index:
             ol.highlighted = self._opt_index[keep]
@@ -2065,6 +2390,17 @@ class LTUI(App):
         fill = width - t.cell_len - 1
         if fill > 0:
             t.append("\u2500" * fill, style=C_FAINT)
+        return t
+
+    def _initiative_header_row(self, init: dict, count: int, width: int) -> Text:
+        color = init.get("color") or C_LAV
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append("\uf024 ", style=color)
+        t.append(init["name"], style=f"bold {color}")
+        t.append(f" · {count} ", style=C_DIM)
+        fill = width - t.cell_len - 1
+        if fill > 0:
+            t.append("─" * fill, style=C_FAINT)
         return t
 
     def _issue_row(self, issue: dict, width: int, id_w: int) -> Text:
@@ -2199,11 +2535,13 @@ class LTUI(App):
     # ── events ────────────────────────────────────────────────────────
     @on(OptionList.OptionSelected, "#teams")
     def _team_selected(self, event: OptionList.OptionSelected) -> None:
-        team = next((t for t in self._teams if t["id"] == event.option.id), None)
-        if team and (self._team is None or team["id"] != self._team["id"]):
+        scope = next(
+            (t for t in self._sidebar_scopes() if t["id"] == event.option.id), None
+        )
+        if scope and (self._team is None or scope["id"] != self._team["id"]):
             if self._detail_issue:
                 self.close_detail()
-            self.load_team(team)
+            self._load_scope(scope)
 
     @on(OptionList.OptionSelected, "#issues")
     def _issue_selected(self, event: OptionList.OptionSelected) -> None:
@@ -2308,6 +2646,11 @@ class LTUI(App):
         team = self._team
         if team is None:
             return
+        if self._all_teams:
+            # a ticket has to be filed against exactly one team, and the
+            # all-teams board deliberately doesn't imply which
+            self.notify("pick a team to file a ticket in", severity="warning")
+            return
 
         def done(result: tuple | None) -> None:
             if result:
@@ -2391,8 +2734,13 @@ class LTUI(App):
             self.query_one("#d-scroll").focus()
 
     def action_toggle_group(self) -> None:
-        self._group_by = "project" if self._group_by == "status" else "status"
+        nxt = (GROUP_MODES.index(self._group_by) + 1) % len(GROUP_MODES)
+        self._group_by = GROUP_MODES[nxt]
         self._save_state()
+        if self._group_by == "initiative" and self._initiatives is None:
+            # first look at this board \u2014 group now, fill the headers in when
+            # the workspace's initiatives land
+            self.load_initiatives(rerender=True)
         self.render_issues()
         self.notify(f"\uf0ca grouping by {self._group_by}")
 
@@ -2416,10 +2764,15 @@ class LTUI(App):
 
     def action_change_status(self) -> None:
         issue = self._current_issue()
-        if not issue or not self._states:
+        if not issue:
+            return
+        # never the merged list the all-teams board renders from: a state id
+        # only means anything to the team that owns it
+        states = self._states_for(issue)
+        if not states:
             return
         opts = []
-        for s in sorted(self._states, key=state_sort_key):
+        for s in sorted(states, key=state_sort_key):
             row = Text()
             row.append(f"{state_icon(s)} ", style=s["color"] or C_SUB)
             row.append(s["name"], style=C_TEXT)
@@ -2441,7 +2794,10 @@ class LTUI(App):
 
     @work(exclusive=True, group="members")
     async def open_labels(self, issue: dict) -> None:
-        team = self._team
+        team, scope = self._team_of(issue), self._scope_id()
+        if team is None:
+            self.notify("no team on this ticket", severity="warning")
+            return
         labels = self._team_labels.get(team["id"])
         if labels is None:
             try:
@@ -2451,7 +2807,7 @@ class LTUI(App):
                 self.notify(f"linear: {e}", severity="error")
                 return
             self._team_labels[team["id"]] = labels
-        if self._team is None or self._team["id"] != team["id"]:
+        if self._scope_id() != scope:
             return
         if not labels:
             self.notify("this team has no labels yet", severity="warning")
@@ -2493,7 +2849,10 @@ class LTUI(App):
 
     @work(exclusive=True, group="members")
     async def open_project_picker(self, issue: dict) -> None:
-        team = self._team
+        team, scope = self._team_of(issue), self._scope_id()
+        if team is None:
+            self.notify("no team on this ticket", severity="warning")
+            return
         projects = self._team_projects.get(team["id"])
         if projects is None:
             try:
@@ -2503,7 +2862,7 @@ class LTUI(App):
                 self.notify(f"linear: {e}", severity="error")
                 return
             self._team_projects[team["id"]] = projects
-        if self._team is None or self._team["id"] != team["id"]:
+        if self._scope_id() != scope:
             return
         current = (issue.get("project") or {}).get("id")
         opts = []
@@ -2547,7 +2906,10 @@ class LTUI(App):
 
     @work(group="mutate")
     async def create_project_and_assign(self, issue: dict, name: str) -> None:
-        team = self._team
+        team = self._team_of(issue)
+        if team is None:
+            self.notify("no team on this ticket", severity="warning")
+            return
         try:
             data = await self.gql(
                 M_PROJECT_CREATE, {"name": name, "teamIds": [team["id"]]}
@@ -2604,7 +2966,10 @@ class LTUI(App):
 
     @work(exclusive=True, group="members")
     async def pick_assignee(self, issue: dict) -> None:
-        team = self._team
+        team, scope = self._team_of(issue), self._scope_id()
+        if team is None:
+            self.notify("no team on this ticket", severity="warning")
+            return
         members = self._members.get(team["id"])
         if members is None:
             try:
@@ -2614,8 +2979,8 @@ class LTUI(App):
                 self.notify(f"linear: {e}", severity="error")
                 return
             self._members[team["id"]] = members
-        if self._team is None or self._team["id"] != team["id"]:
-            return  # user switched teams while fetching
+        if self._scope_id() != scope:
+            return  # user switched boards while fetching
         current = (issue.get("assignee") or {}).get("id")
         opts = []
         if self._viewer_id:
@@ -2710,7 +3075,7 @@ auth: LINEAR_API_KEY env var, ~/.config/ltui/config.toml, or
 
 keys: enter open ticket   n new   s status   p priority   c comment
       a assign   l labels   P project   o browser   y yank   / filter
-      m mine only   v group
+      m mine only   v group status/project/initiative
       V one project   t theme
       , settings   j/k navigate   g/G top/bottom   r refresh   ? help
       q quit
