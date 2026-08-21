@@ -694,6 +694,23 @@ class NavList(OptionList):
                     self.highlighted = j
                     return
 
+    def action_first(self) -> None:
+        """Jump to the top of the list, not just to the first *option*.
+
+        OptionList.action_first only assigns `highlighted`, so when the
+        highlight already sits on the first enabled row the reactive never
+        changes and nothing scrolls — leaving the disabled group header above
+        it stranded off-screen. Scroll home regardless of where the highlight
+        was: `g` means the top of the list.
+        """
+        super().action_first()
+        self.scroll_home(animate=False)
+
+    def action_last(self) -> None:
+        """Mirror of `action_first` for `G`."""
+        super().action_last()
+        self.scroll_end(animate=False)
+
     def action_page_down(self) -> None:
         super().action_page_down()
         self._snap_to_enabled(1)
@@ -2562,7 +2579,7 @@ class LTUI(App):
     # ── actions ───────────────────────────────────────────────────────
     def action_refresh(self) -> None:
         if self._team:
-            self.load_team(self._team)
+            self._load_scope(self._team)
 
     def _tick_fx(self) -> None:
         if not CONFIG_OPTIONS.get("animations", True):
