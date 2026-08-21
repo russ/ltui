@@ -2420,11 +2420,29 @@ class LTUI(App):
             t.append("─" * fill, style=C_FAINT)
         return t
 
+    def _identifier_style(self, issue: dict) -> str:
+        """What colour an issue's identifier prefix renders in.
+
+        On a board spanning teams the prefix is the only thing saying which
+        team a row belongs to, and an initiative bucket can easily mix six of
+        them. `_stamp_team` already carries the team's own colour onto every
+        issue, so tinting the prefix with it separates those buckets at a
+        glance for no extra width and no extra query.
+
+        Single-team boards keep the dim prefix — every row would be the same
+        colour, so it would only add noise. Falls back to dim for a team with
+        no colour set, and for issues off a cache written before issues
+        carried a team.
+        """
+        if not self._all_teams:
+            return C_DIM
+        return (self._team_of(issue) or {}).get("color") or C_DIM
+
     def _issue_row(self, issue: dict, width: int, id_w: int) -> Text:
         st = issue["state"]
         t = Text(no_wrap=True, overflow="ellipsis")
         t.append(f"{state_icon(st)} ", style=st["color"] or C_SUB)
-        t.append(issue["identifier"].ljust(id_w), style=C_DIM)
+        t.append(issue["identifier"].ljust(id_w), style=self._identifier_style(issue))
         t.append(" ")
 
         assignee = (issue.get("assignee") or {}).get("displayName") or ""
