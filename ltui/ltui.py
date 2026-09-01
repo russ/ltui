@@ -15,6 +15,7 @@ __version__ = "0.15.0"
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -44,6 +45,7 @@ LTUI_JSON_CONFIG = Path.home() / ".config/ltui/config.json"
 LINEAR_CODING_TOOLS = Path.home() / ".linear/coding-tools.json"
 # Mirrors Linear's "Prompt template" setting so ltui builds the same prompt.
 LINEAR_PROMPT_TEMPLATE = Path.home() / ".linear/prompt-template.txt"
+PLACEHOLDER = re.compile(r"\{\{([A-Za-z][\w.]*)\}\}")
 STATE_FILE = Path.home() / ".local/state/ltui/state.json"
 CACHE_DIR = Path.home() / ".cache/ltui"
 AUTO_REFRESH_SECONDS = 180
@@ -389,7 +391,7 @@ DEFAULT_KEYBINDS = {
     "change_assignee": (["a"], None),
     "open_browser": (["o"], None),
     "yank": (["y"], None),
-    "run_script": (["x"], "script"),
+    "run_script": (["x"], None),
     # vim layer (additive)
     "next_group": (["right_square_bracket"], None),
     "prev_group": (["left_square_bracket"], None),
@@ -464,8 +466,6 @@ CONFIG_TEMPLATE = """{
 
 
 def load_api_key() -> str:
-    import os
-
     if key := os.environ.get("LINEAR_API_KEY"):
         return key
     try:
@@ -3096,27 +3096,35 @@ class LTUI(App):
         if not path:
             self.notify(" coding-tools.json: openIssue.path missing", severity="error")
             return
+        path = Path(str(path)).expanduser()
 
         title = issue.get("title") or ""
         body = issue.get("description") or ""
         tmpl = {
             "issue.identifier": issue.get("identifier") or "",
-            "issue.branchName": issue.get("branchName") or issue.get("identifier", "").lower(),
+            "issue.branchName": (
+                issue.get("branchName") or (issue.get("identifier") or "").lower()
+            ),
             "issue.title": title,
             "issue.url": issue.get("url") or "",
             "project.name": (issue.get("project") or {}).get("name") or "",
             "context": f"{title}\n\n{body}".strip(),
             "workDir": str(Path.cwd()),
         }
+
+        def interp(s: str) -> str:
+            # one pass: a {{...}} that arrives *inside* ticket text — which
+            # anyone with workspace access can write — stays literal instead
+            # of being expanded on a later iteration.
+            return PLACEHOLDER.sub(lambda m: tmpl.get(m[1], m[0]), s)
+
         # Linear renders its "Prompt template" setting before handing the
         # script LINEAR_PROMPT; do the same so both entry points agree.
         try:
             template = LINEAR_PROMPT_TEMPLATE.read_text()
         except Exception:
             template = "{{context}}"
-        for k, v in tmpl.items():
-            template = template.replace("{{" + k + "}}", v)
-        tmpl["prompt"] = template.strip()
+        tmpl["prompt"] = interp(template).strip()
 
         exported = {
             "LINEAR_ISSUE_IDENTIFIER": tmpl["issue.identifier"],
@@ -3127,21 +3135,26 @@ class LTUI(App):
             "LINEAR_PROMPT": tmpl["prompt"],
             "LINEAR_WORK_DIR": tmpl["workDir"],
         }
-        # Linear's semantics: an "env" list selects which vars to expose.
+        # Linear's semantics: an "env" list selects which vars to expose. ltui
+        # owns the whole LINEAR_ namespace in the child, so what the allowlist
+        # leaves out is genuinely absent rather than inherited from our own
+        # environment behind the user's back — LINEAR_API_KEY above all. A
+        # name that isn't ours but is in our environment can still be listed
+        # explicitly, which makes passing the key along a deliberate act.
         wanted = cfg.get("env")
         if isinstance(wanted, list) and wanted:
-            exported = {k: v for k, v in exported.items() if k in wanted}
-
-        def interp(s: str) -> str:
-            for k, v in tmpl.items():
-                s = s.replace("{{" + k + "}}", v)
-            return s
+            exported = {
+                k: exported.get(k, os.environ.get(k, ""))
+                for k in wanted
+                if isinstance(k, str) and (k in exported or k in os.environ)
+            }
+        inherited = {k: v for k, v in os.environ.items() if not k.startswith("LINEAR_")}
 
         argv = [str(path), *(interp(str(a)) for a in (cfg.get("args") or []))]
         try:
             subprocess.Popen(
                 argv,
-                env={**os.environ, **exported, "LINEAR_TOOL_COMMAND": "ltui"},
+                env={**inherited, **exported, "LINEAR_TOOL_COMMAND": "ltui"},
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

@@ -263,8 +263,13 @@ Placeholders for `args`: `{{issue.identifier}}`, `{{issue.branchName}}`,
 The `env` list is an allowlist selecting which of `LINEAR_ISSUE_IDENTIFIER`,
 `LINEAR_ISSUE_BRANCH_NAME`, `LINEAR_ISSUE_TITLE`, `LINEAR_ISSUE_URL`,
 `LINEAR_PROJECT_NAME`, `LINEAR_PROMPT` and `LINEAR_WORK_DIR` are exported; omit
-it to export all of them. `LINEAR_TOOL_COMMAND=ltui` is always set, so a shared
-script can tell the TUI apart from the desktop app.
+it to export all of them. It governs the whole `LINEAR_` namespace, not just
+those seven: any other `LINEAR_*` variable in ltui's own environment — most
+importantly `LINEAR_API_KEY` — is withheld from your script unless you name it
+in the list, so handing it your credentials is a deliberate act rather than an
+accident. The rest of your environment is inherited as usual, and
+`LINEAR_TOOL_COMMAND=ltui` is always set, so a shared script can tell the TUI
+apart from the desktop app.
 
 `LINEAR_PROMPT` is rendered from `~/.linear/prompt-template.txt` if present —
 the equivalent of Linear's **Prompt template** setting — falling back to
@@ -278,7 +283,6 @@ Read Linear issue {{issue.identifier}} and await further instructions.
 
 The script is detached from the TUI's terminal, so it will not fight ltui for
 the tty; have it log somewhere or open a window of its own.
-
 
 key names are [Textual key names](https://textual.textualize.io/guide/input/#key)
 (`slash`, `comma`, `question_mark`, `ctrl+x`, …). unknown or invalid entries
